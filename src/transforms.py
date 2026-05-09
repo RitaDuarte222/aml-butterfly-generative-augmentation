@@ -4,8 +4,8 @@ import torchvision.transforms as transforms
 IMAGE_SIZE = 64
 
 # Estes valores foram calculados no notebook 00_dataset_exploration
-BUTTERFLY_MEAN = [0.480, 0.466, 0.338] # Exemplo, atualizar com os reais se necessário
-BUTTERFLY_STD  = [0.216, 0.211, 0.204]
+BUTTERFLY_MEAN = [0.480, 0.466, 0.338]
+BUTTERFLY_STD  = [0.216, 0.211, 0.204] 
 
 def get_transforms():
     # Transformações para o treino (com alguma normalização mas SEM data augmentation gerativa)
