@@ -5,13 +5,16 @@ __pycache__/
 # Jupyter
 .ipynb_checkpoints/
 
-# Data
+# Data (never commit raw or generated images)
 data/raw/
 data/generated/
 data/augmented/
 
-# Outputs
+# Outputs — model weights, plots, results (large binary files)
 outputs/
+*.pth
+*.pt
+*.ckpt
 
 # Mac
 .DS_Store
