@@ -50,3 +50,4 @@ class ButterflyDataset(Dataset):
             label = self.class_to_idx[row["label"]]
 
         return image, torch.tensor(label, dtype=torch.long)
+    
