@@ -6,6 +6,8 @@ Architecture
 Forward process : q(x_t | x_{t-1}) = N(sqrt(1-beta_t)*x_{t-1}, beta_t*I)
 Reverse process : p_theta(x_{t-1} | x_t) predicted by a class-conditional UNet
 UNet            : DownBlocks -> Bottleneck -> UpBlocks + time/class embeddings
+                  Attention at 32x32, 16x16, and 8x8 (bottleneck) resolutions
+CFG             : Classifier-Free Guidance support (guidance_scale > 1.0)
 
 Input  : 3 x 64 x 64 RGB images in [-1, 1]
 Output : 3 x 64 x 64 denoised images
@@ -42,6 +44,7 @@ class GaussianDiffusion:
     """
     Precomputes all alpha/beta statistics for a given schedule.
     Provides q_sample (forward) and predict_x0 helpers.
+    Supports Classifier-Free Guidance (CFG) during sampling.
     """
 
     def __init__(self, betas: torch.Tensor):
@@ -86,35 +89,56 @@ class GaussianDiffusion:
         s2 = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x0.shape)
         return s1 * x0 + s2 * noise
 
-    def p_losses(self, model, x0, t, class_labels=None, loss_type='l2'):
-        """Compute training loss (predict noise)."""
+    def p_losses(self, model, x0, t, class_labels=None, loss_type='l2', cfg_dropout=0.1):
+        """
+        Compute training loss (predict noise).
+        With CFG dropout: randomly drop class labels to train unconditional path.
+        """
         noise = torch.randn_like(x0)
         x_noisy = self.q_sample(x0, t, noise)
+
+        # Classifier-Free Guidance: randomly null out class labels during training
+        if class_labels is not None and cfg_dropout > 0:
+            drop_mask = torch.rand(class_labels.shape[0], device=class_labels.device) < cfg_dropout
+            # Use num_classes as null token (model must accept num_classes index)
+            null_label = torch.full_like(class_labels, model.num_classes)
+            class_labels = torch.where(drop_mask, null_label, class_labels)
+
         pred = model(x_noisy, t, class_labels)
         if loss_type == 'l1':
             return F.l1_loss(pred, noise)
         return F.mse_loss(pred, noise)
 
     @torch.no_grad()
-    def p_sample(self, model, x, t, t_index, class_labels=None):
-        """Single reverse step."""
-        betas_t          = self._extract(self.betas, t, x.shape)
-        s1               = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
-        recip            = self._extract(self.sqrt_recip_alphas_cumprod, t, x.shape)
-        model_mean = recip * (x - betas_t / s1 * model(x, t, class_labels))
+    def p_sample(self, model, x, t, t_index, class_labels=None, guidance_scale=1.0):
+        """Single reverse step with optional CFG."""
+        betas_t = self._extract(self.betas, t, x.shape)
+        s1      = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
+        recip   = self._extract(self.sqrt_recip_alphas_cumprod, t, x.shape)
+
+        if guidance_scale > 1.0 and class_labels is not None:
+            # CFG: run model twice — conditioned and unconditioned
+            null_labels = torch.full_like(class_labels, model.num_classes)
+            noise_cond   = model(x, t, class_labels)
+            noise_uncond = model(x, t, null_labels)
+            noise_pred   = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+        else:
+            noise_pred = model(x, t, class_labels)
+
+        model_mean = recip * (x - betas_t / s1 * noise_pred)
         if t_index == 0:
             return model_mean
-        post_log_var     = self._extract(self.posterior_log_variance_clipped, t, x.shape)
+        post_log_var = self._extract(self.posterior_log_variance_clipped, t, x.shape)
         noise = torch.randn_like(x)
         return model_mean + (0.5 * post_log_var).exp() * noise
 
     @torch.no_grad()
-    def p_sample_loop(self, model, shape, class_labels=None, device='cpu'):
-        """Full reverse diffusion loop: x_T -> x_0."""
+    def p_sample_loop(self, model, shape, class_labels=None, device='cpu', guidance_scale=1.0):
+        """Full reverse diffusion loop: x_T -> x_0 with optional CFG."""
         x = torch.randn(shape, device=device)
         for i in reversed(range(self.T)):
             t = torch.full((shape[0],), i, device=device, dtype=torch.long)
-            x = self.p_sample(model, x, t, i, class_labels)
+            x = self.p_sample(model, x, t, i, class_labels, guidance_scale=guidance_scale)
         return x
 
     def to(self, device):
@@ -148,17 +172,23 @@ class SinusoidalPE(nn.Module):
 
 
 class ResBlock(nn.Module):
+    """
+    Residual block with time and class conditioning.
+    num_classes+1 embeddings: indices 0..num_classes-1 = real classes,
+    index num_classes = unconditional (null) token for CFG.
+    """
     def __init__(self, in_ch, out_ch, time_dim, num_classes=0, dropout=0.1):
         super().__init__()
-        self.norm1 = nn.GroupNorm(8, in_ch)
+        self.norm1 = nn.GroupNorm(min(8, in_ch), in_ch)
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-        self.norm2 = nn.GroupNorm(8, out_ch)
+        self.norm2 = nn.GroupNorm(min(8, out_ch), out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
         self.drop  = nn.Dropout(dropout)
 
         self.time_mlp = nn.Sequential(nn.SiLU(), nn.Linear(time_dim, out_ch * 2))
         if num_classes > 0:
-            self.class_emb = nn.Embedding(num_classes, out_ch)
+            # +1 for unconditional (null) token
+            self.class_emb = nn.Embedding(num_classes + 1, out_ch)
         else:
             self.class_emb = None
         self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
@@ -168,7 +198,7 @@ class ResBlock(nn.Module):
         # time conditioning
         scale, shift = self.time_mlp(t_emb).chunk(2, dim=1)
         h = h * (scale[:, :, None, None] + 1) + shift[:, :, None, None]
-        # class conditioning
+        # class conditioning (includes null token for CFG)
         if self.class_emb is not None and class_emb is not None:
             h = h + self.class_emb(class_emb)[:, :, None, None]
         h = self.drop(self.conv2(F.silu(self.norm2(h))))
@@ -176,9 +206,10 @@ class ResBlock(nn.Module):
 
 
 class Attention(nn.Module):
+    """Multi-head self-attention for spatial feature maps."""
     def __init__(self, ch, heads=4):
         super().__init__()
-        self.norm = nn.GroupNorm(8, ch)
+        self.norm = nn.GroupNorm(min(8, ch), ch)
         self.attn = nn.MultiheadAttention(ch, heads, batch_first=True)
 
     def forward(self, x):
@@ -189,43 +220,54 @@ class Attention(nn.Module):
 
 
 class Down(nn.Module):
-    def __init__(self, in_ch, out_ch, time_dim, num_classes=0):
+    """Downsampling block with optional attention."""
+    def __init__(self, in_ch, out_ch, time_dim, num_classes=0, use_attn=False):
         super().__init__()
         self.res  = ResBlock(in_ch, out_ch, time_dim, num_classes)
+        self.attn = Attention(out_ch) if use_attn else nn.Identity()
         self.down = nn.Conv2d(out_ch, out_ch, 3, stride=2, padding=1)
 
     def forward(self, x, t, c=None):
         x = self.res(x, t, c)
+        x = self.attn(x)
         return self.down(x), x   # return downsampled + skip
 
 
 class Up(nn.Module):
-    def __init__(self, in_ch, skip_ch, out_ch, time_dim, num_classes=0):
+    """Upsampling block with optional attention."""
+    def __init__(self, in_ch, skip_ch, out_ch, time_dim, num_classes=0, use_attn=False):
         super().__init__()
         self.up  = nn.ConvTranspose2d(in_ch, in_ch, 2, stride=2)
         self.res = ResBlock(in_ch + skip_ch, out_ch, time_dim, num_classes)
+        self.attn = Attention(out_ch) if use_attn else nn.Identity()
 
     def forward(self, x, skip, t, c=None):
         x = self.up(x)
         x = torch.cat([x, skip], dim=1)
-        return self.res(x, t, c)
+        x = self.res(x, t, c)
+        return self.attn(x)
 
 
 # ─────────────────────────────────────────────
-# 4. Class-conditional UNet
+# 4. Class-conditional UNet with CFG support
 # ─────────────────────────────────────────────
 
 class UNet(nn.Module):
     """
     Compact UNet noise predictor for 64x64 images.
+    Supports Classifier-Free Guidance (CFG) via null class token.
+    Attention at 32x32, 16x16, and bottleneck (8x8).
 
     Parameters
     ----------
     base_ch     : base channel count (multiplied per level)
     num_classes : number of conditioning classes (0 = unconditional)
+    time_dim    : sinusoidal time embedding dimension
     """
     def __init__(self, base_ch=64, num_classes=75, time_dim=256):
         super().__init__()
+        self.num_classes = num_classes  # stored for CFG null token
+
         self.time_mlp = nn.Sequential(
             SinusoidalPE(time_dim),
             nn.Linear(time_dim, time_dim * 4),
@@ -235,10 +277,11 @@ class UNet(nn.Module):
 
         nc = num_classes
         # Encoder
-        self.in_conv = nn.Conv2d(3, base_ch, 3, padding=1)          # 64
-        self.d1 = Down(base_ch,      base_ch * 2, time_dim, nc)      # ->32
-        self.d2 = Down(base_ch * 2,  base_ch * 4, time_dim, nc)      # ->16
-        self.d3 = Down(base_ch * 4,  base_ch * 8, time_dim, nc)      # ->8
+        # 64x64 -> 32x32 (with attention)
+        self.in_conv = nn.Conv2d(3, base_ch, 3, padding=1)
+        self.d1 = Down(base_ch,      base_ch * 2, time_dim, nc, use_attn=True)   # ->32, attn
+        self.d2 = Down(base_ch * 2,  base_ch * 4, time_dim, nc, use_attn=True)   # ->16, attn
+        self.d3 = Down(base_ch * 4,  base_ch * 8, time_dim, nc, use_attn=False)  # ->8
 
         # Bottleneck with attention
         self.mid1  = ResBlock(base_ch * 8, base_ch * 8, time_dim, nc)
@@ -246,12 +289,12 @@ class UNet(nn.Module):
         self.mid2  = ResBlock(base_ch * 8, base_ch * 8, time_dim, nc)
 
         # Decoder
-        self.u1 = Up(base_ch * 8, base_ch * 8, base_ch * 4, time_dim, nc)  # ->16
-        self.u2 = Up(base_ch * 4, base_ch * 4, base_ch * 2, time_dim, nc)  # ->32
-        self.u3 = Up(base_ch * 2, base_ch * 2, base_ch,     time_dim, nc)  # ->64
+        self.u1 = Up(base_ch * 8, base_ch * 8, base_ch * 4, time_dim, nc, use_attn=False) # ->16
+        self.u2 = Up(base_ch * 4, base_ch * 4, base_ch * 2, time_dim, nc, use_attn=True)  # ->32, attn
+        self.u3 = Up(base_ch * 2, base_ch * 2, base_ch,     time_dim, nc, use_attn=True)  # ->64, attn
 
         self.out_conv = nn.Sequential(
-            nn.GroupNorm(8, base_ch),
+            nn.GroupNorm(min(8, base_ch), base_ch),
             nn.SiLU(),
             nn.Conv2d(base_ch, 3, 1),
         )
