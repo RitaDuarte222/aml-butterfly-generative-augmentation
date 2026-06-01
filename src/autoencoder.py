@@ -73,6 +73,7 @@ class VAE(nn.Module):
 
     def forward(self, x):
         mu, log_var = self.encoder(x)
+        log_var = torch.clamp(log_var, min=-20.0, max=20.0)  # prevent overflow/NaN on MPS
         z = self.reparameterise(mu, log_var)
         return self.decoder(z), mu, log_var
 
